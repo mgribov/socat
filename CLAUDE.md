@@ -4,23 +4,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single Bash script, `socat.sh` — a locally modified copy of socat's `socat-mux.sh` helper. It is not a git repo, has no build system, no tests, and no README. The only work here is editing this one script.
+A single Bash script, `socat.sh` — a locally modified copy of socat's `socat-mux.sh` helper, plus `test-socat-mux.sh`, its regression suite. No build system, no README.
 
-The local divergence from upstream is the child-reaping logic (`reapChild`, the `EXIT`/`SIGCHLD` traps, `set -bm`); the argument parsing, port discovery, and the two `socat` invocations are upstream's. Assume any change request is about process/signal handling unless stated otherwise.
+**The upstream original is installed at `/usr/bin/socat-mux.sh`** (from the `socat` package). Diff against it before changing anything — it is the reference for everything except the documented local changes below.
+
+Local divergences from upstream, all deliberate:
+- `SOCAT` falls back to `$PATH` when there is no `socat` binary beside the script (upstream sets `SOCAT=./socat` unconditionally when `$0` contains a slash, which breaks `bash ./socat.sh`).
+- Free-port discovery falls back to `ss`/`netstat` when the socat-based probe yields nothing (old socat versions).
+- Teardown goes through `reapChild()` + `onChildExit()` instead of upstream's one-line SIGCHLD trap, and SIGTERM/SIGINT/SIGHUP are trapped.
 
 ## Running it
 
 ```bash
-bash socat.sh [-V] [-q] [-d…] [-l…] [-b|-S|-t|-T N] <LISTENER-ADDRESS> <TARGET-ADDRESS>
+./socat.sh [-V] [-q] [-d…] [-l…] [-b|-S|-t|-T N] <LISTENER-ADDRESS> <TARGET-ADDRESS>
 # e.g.
-bash socat.sh TCP4-LISTEN:8080,reuseaddr EXEC:'/bin/cat'
+./socat.sh TCP4-LISTEN:8080,reuseaddr EXEC:'/bin/cat'
 ```
 
-Invoke with `bash` explicitly: the file has **no shebang** and is not executable, and it uses bashisms (`[[ ]]`, `shopt`, `$RANDOM`, `function`, `set -bm`) despite the `case "X$1"` sh-style idioms.
+`-V` prints the resolved `socat` path, the chosen UDP ports, and the two `socat` command lines — the main debugging tool. `-q` suppresses the child-exit messages.
 
-`-V` prints the resolved `socat` path, the chosen UDP ports, and the two `socat` command lines it is about to run — that is the main debugging tool. There is no lint config; `shellcheck socat.sh` is the useful check.
+## Testing
 
-`socat` is **not installed** in this environment, so the script cannot be run end to end here. `ss` and `netstat` are present, so the fallback port-picking branch (lines 43-55) is exercisable.
+```bash
+bash test-socat-mux.sh              # 18 assertions, ~25s
+bash test-socat-mux.sh /path/to/other-socat.sh
+```
+
+Covers the CLI surface (`-h`, missing args, unknown option, `-V`), the one-to-all fan-out with three live clients, and teardown (no orphaned `socat` children after the script exits or after one child is killed).
+
+Gotcha when writing tests or ad-hoc checks: the suite finds children with `pgrep -f 'lp mux'`. Any shell command whose *own* argv contains that string matches too, so `pkill -f 'lp mux'` typed directly on a command line can kill the invoking shell. Keep such patterns inside a script file.
+
+No lint config, and `shellcheck` is not installed here.
 
 ## Architecture: how the multiplexer works
 
@@ -37,14 +51,11 @@ Two free UDP ports are found by running `socat -d -d -T 0.000001 UDP4-RECV:0` an
 
 `SOCAT` resolves to a `socat` binary sitting next to the script (`${0%/*}/socat`) before falling back to `$PATH`, so a locally built socat can be tested by dropping it in this directory.
 
-## Known-broken state
+## Process/signal handling
 
-The script is mid-edit and does not currently work as intended. Do not treat these as pre-existing behavior to preserve:
+This is where the local work happened and where the bugs were, so change it carefully:
 
-- **`usage` is never defined.** It is called on `-h`, on an unknown option, and on missing parameters (lines 4, 11, 24) — all three paths print `usage: command not found`. Upstream defines it; it was dropped along with the shebang.
-- **`$ECHO` is unset**, so the `-V` command-line dump (lines 97, 107) prints nothing.
-- **No `wait` at the end.** The script falls off line 115 immediately after backgrounding both processes, which fires the `EXIT` trap and tears down the very children it just started.
-- **`reapChild` is called in a command substitution** (`pid1=$(reapChild "${pid1}")`), but all of its output goes to stderr — so it always assigns the empty string, and the pid is lost rather than updated.
-- **Invalid `return` values**: `return -1` (line 73) and `return p_childPid` (line 80) are not valid exit statuses; bash errors on the former and evaluates the latter as an arithmetic expression on an unset name, yielding 0.
-
-When fixing signal handling, note the `SIGCHLD` trap (line 92) disarms itself with `trap - SIGCHLD` after the first child exits, and the commented-out variants above it (lines 90, 94) are the earlier attempts — worth reading before proposing a new approach.
+- `set -bm` gives each child its own process group. A terminal signal therefore reaches only the script, never the `socat` children — which is why SIGTERM/SIGINT/SIGHUP are explicitly trapped to `exit 1` and cleanup is left to the EXIT trap. Drop that trap and killing the script orphans both children.
+- `onChildExit` (the SIGCHLD handler) disarms itself with `trap - SIGCHLD` before reaping the sibling, otherwise reaping re-enters the handler. It identifies the dead child by testing `kill -0 "$pid1"`, then uses `wait "$pid"` to get the real exit status. (Upstream reports `rc=$?` there, which is the status of its own `kill -0` test, not the child's.)
+- `reapChild` must be called **directly**, never as `pid=$(reapChild …)`. It writes to stderr and communicates via exit status, so a command substitution captures the empty string; a `$( )` subshell also cannot clear the caller's pid variable. Clear the pid in the caller instead (`reapChild "$pid1"; pid1=`).
+- The script must end in `wait`. Without it execution falls off the end immediately after backgrounding both processes, firing the EXIT trap and killing the children it just started.
