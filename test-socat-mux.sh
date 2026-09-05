@@ -6,9 +6,21 @@ SCRIPT=${1:-/home/max/claude/socat/socat.sh}
 TMP=$(mktemp -d)
 PASS=0 FAIL=0
 
+HELPERS=()
+
+# Helpers must be killed by pid and started with stdout redirected: anything
+# still holding this script's stdout keeps a piped reader (tail, grep) waiting
+# long after the tests are done.
 cleanup_all() {
-    pkill -f 'lp muxfwd' 2>/dev/null
-    pkill -f 'lp muxlst' 2>/dev/null
+    pkill -f 'lp mux' 2>/dev/null
+    local p
+    for p in "${HELPERS[@]}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null
+    done
+    # socat SYSTEM: children (the READY loop) survive their socat parent.
+    # $TMP is unique to this run, so these patterns cannot hit anyone else.
+    pkill -f "$TMP/device-saw.bin" 2>/dev/null
+    pkill -f "PTY,link=$TMP" 2>/dev/null
     rm -rf "$TMP"
 }
 trap cleanup_all EXIT
@@ -97,6 +109,87 @@ else
 fi
 kill $SPID 2>/dev/null
 pkill -f 'lp mux' 2>/dev/null
+
+## --- Test 9: --telnet mode ---------------------------------------------
+# A raw TCP port leaves a telnet client echoing locally, so every keystroke
+# shows twice and a password typed at a non-echoing prompt is visible.
+# --telnet must announce IAC WILL ECHO and keep negotiation off the target.
+DIR=$(cd "$(dirname "$SCRIPT")" && pwd)
+if [ ! -r "$DIR/socat-telnet-shim.py" ]; then
+    echo "  SKIP: telnet tests (no socat-telnet-shim.py beside $SCRIPT)"
+elif ! type python3 >/dev/null 2>&1 || ! type telnet >/dev/null 2>&1 || ! type script >/dev/null 2>&1; then
+    echo "  SKIP: telnet tests (need python3, telnet and script)"
+else
+    P=$(freeport)
+    HOST=$TMP/vhost; DEV=$TMP/vdev
+    socat PTY,link="$HOST",raw,echo=0 PTY,link="$DEV",raw,echo=0 >/dev/null 2>&1 &
+    HELPERS+=($!)
+    sleep 1
+    # Simulated device: announces READY once a second, records what it receives.
+    socat "$DEV",raw,echo=0 \
+          SYSTEM:"(while :; do printf 'READY\\r\\n'; sleep 1; done & cat > $TMP/device-saw.bin)" \
+          >/dev/null 2>&1 &
+    HELPERS+=($!)
+    sleep 0.5
+
+    timeout 30 bash "$SCRIPT" --telnet "TCP4-L:$P,reuseaddr" "file:$HOST,echo=0,raw" \
+        >"$TMP/s9.out" 2>&1 &
+    SPID=$!
+    sleep 2
+
+    n=$(pgrep -f 'lp mux' 2>/dev/null | wc -l)
+    check "$n" "3" "--telnet starts three socat processes"
+
+    { sleep 2; printf 'hunter2\n'; sleep 2; printf '\035quit\n'; sleep 1; } \
+        | timeout 15 script -q -c "telnet 127.0.0.1 $P" "$TMP/telnet.raw" >/dev/null 2>&1
+
+    if grep -q hunter2 "$TMP/telnet.raw" 2>/dev/null; then
+        bad "telnet client does not echo locally"
+    else
+        ok "telnet client does not echo locally"
+    fi
+    if grep -q READY "$TMP/telnet.raw" 2>/dev/null; then
+        ok "device output reaches the telnet client"
+    else
+        bad "device output reaches the telnet client"
+    fi
+    if grep -qa hunter2 "$TMP/device-saw.bin" 2>/dev/null; then
+        ok "telnet client input reaches the device"
+    else
+        bad "telnet client input reaches the device"
+    fi
+    if LC_ALL=C grep -qa $'\xff' "$TMP/device-saw.bin" 2>/dev/null; then
+        bad "no telnet IAC bytes leak to the device"
+    else
+        ok "no telnet IAC bytes leak to the device"
+    fi
+
+    kill $SPID 2>/dev/null
+    sleep 2
+    n=$(pgrep -f 'lp mux' 2>/dev/null | wc -l)
+    check "$n" "0" "--telnet leaves no orphaned processes"
+    pkill -f 'lp mux' 2>/dev/null
+
+    ## --- Test 10: --telnet without the shim fails cleanly ---------------
+    cp "$SCRIPT" "$TMP/lonely.sh"
+    out=$(timeout 10 bash "$TMP/lonely.sh" --telnet "TCP4-L:$(freeport)" EXEC:/bin/cat 2>&1); rc=$?
+    check "$rc" "1" "--telnet without the shim exits 1"
+    if echo "$out" | grep -q "socat-telnet-shim.py"; then
+        ok "--telnet without the shim names the missing file"
+    else
+        bad "--telnet without the shim names the missing file"
+    fi
+fi
+
+## --- Test 11: telnet filter unit tests ---------------------------------
+if [ -r "$DIR/test-telnet-filter.py" ] && type python3 >/dev/null 2>&1; then
+    if out=$(python3 "$DIR/test-telnet-filter.py" 2>&1); then
+        ok "telnet filter unit tests ($(echo "$out" | grep -c PASS) assertions)"
+    else
+        bad "telnet filter unit tests"
+        echo "$out" | grep FAIL | sed 's/^/    /'
+    fi
+fi
 
 echo
 echo "== $PASS passed, $FAIL failed =="
